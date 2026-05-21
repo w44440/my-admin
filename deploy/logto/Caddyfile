@@ -1,0 +1,7 @@
+{$AUTH_DOMAIN} {
+  reverse_proxy logto:3001
+}
+
+{$ADMIN_DOMAIN} {
+  reverse_proxy logto:3002
+}
