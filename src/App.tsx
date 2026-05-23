@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { useHandleSignInCallback, useLogto, type IdTokenClaims } from '@logto/react'
 import {
@@ -21,24 +21,37 @@ import { Badge } from './components/ui/badge'
 import { Button } from './components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card'
 import { Input } from './components/ui/input'
-import { appUrl, callbackUrl, isLogtoConfigured } from './lib/logto'
+import { appUrl, authEnabled, authMisconfigured, authRequired, callbackUrl } from './lib/logto'
+import {
+  displayCountOptions,
+  formatCollectedAt,
+  gatewayOptions,
+  getMaxStartNo,
+  lightsWsUrl,
+  normalizeLightStatus,
+  type DevicePayload,
+  type DisplayCount,
+  type GatewayOption,
+  type SignalLightsMessage,
+} from './lib/signal-lights'
 import { cn } from './lib/utils'
 import { auditEvents, mockUsers, systemMetrics } from './lib/mock-data'
 
 function App() {
   return (
     <Routes>
-      <Route path="/sign-in" element={<SignInPage />} />
+      <Route path="/" element={<EntryPage />} />
+      <Route path="/sign-in" element={<Navigate to="/" replace />} />
       <Route path="/callback" element={<CallbackPage />} />
-      <Route element={<ProtectedRoute />}>
+        <Route element={<ProtectedRoute />}>
         <Route element={<Shell />}>
-          <Route index element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/signal-lights" element={<SignalLightsPage />} />
           <Route path="/users" element={<UsersPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Route>
       </Route>
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
 }
@@ -47,12 +60,20 @@ function ProtectedRoute() {
   const { isAuthenticated, isLoading } = useLogto()
   const location = useLocation()
 
+  if (!authRequired) {
+    return <Outlet />
+  }
+
+  if (authMisconfigured) {
+    return <Navigate to="/" replace state={{ from: location.pathname, authMisconfigured: true }} />
+  }
+
   if (isLoading) {
     return <FullScreenState title="Checking session" description="Preparing your admin workspace." />
   }
 
   if (!isAuthenticated) {
-    return <Navigate to="/sign-in" replace state={{ from: location.pathname }} />
+    return <Navigate to="/" replace state={{ from: location.pathname }} />
   }
 
   return <Outlet />
@@ -101,6 +122,7 @@ function Shell() {
 function Sidebar({ collapsed, closeMobile }: { collapsed: boolean; closeMobile: () => void }) {
   const links = [
     { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+    { to: '/signal-lights', label: '三色灯状态', icon: Activity },
     { to: '/users', label: 'Users', icon: Users },
     { to: '/settings', label: 'Settings', icon: Settings },
   ]
@@ -174,10 +196,15 @@ function TopBar({
   const [claims, setClaims] = useState<IdTokenClaims>()
 
   useEffect(() => {
+    if (!authEnabled) {
+      setClaims(undefined)
+      return
+    }
+
     void getIdTokenClaims().then(setClaims).catch(() => setClaims(undefined))
   }, [getIdTokenClaims])
 
-  const displayName = claims?.name || claims?.email || claims?.sub || 'Signed in user'
+  const displayName = authEnabled ? claims?.name || claims?.email || claims?.sub || 'Signed in user' : authRequired ? 'Auth setup required' : 'Public preview'
 
   return (
     <header className="sticky top-0 z-20 flex h-16 items-center gap-3 border-b border-border bg-background/90 px-4 backdrop-blur sm:px-6 lg:px-8">
@@ -213,10 +240,14 @@ function TopBar({
           <span className="max-w-40 truncate">{displayName}</span>
           <ChevronDown className="h-4 w-4 text-muted-foreground" />
         </div>
-        <Button variant="outline" size="sm" onClick={() => signOut(appUrl)}>
-          <LogOut className="h-4 w-4" />
-          <span className="hidden sm:inline">Sign out</span>
-        </Button>
+        {authEnabled ? (
+          <Button variant="outline" size="sm" onClick={() => signOut(appUrl)}>
+            <LogOut className="h-4 w-4" />
+            <span className="hidden sm:inline">Sign out</span>
+          </Button>
+        ) : (
+          <Badge variant="secondary">{authRequired ? 'Auth pending' : 'Preview mode'}</Badge>
+        )}
       </div>
     </header>
   )
@@ -265,7 +296,11 @@ function DashboardPage() {
             <CardDescription>Static health signals for the first version.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
-            {['Web app', 'Logto redirect', 'Mock data'].map((item) => (
+            {[
+              'Web app',
+              authEnabled ? 'Logto redirect' : authRequired ? 'Logto setup' : 'Public entry',
+              'Mock data',
+            ].map((item) => (
               <div key={item} className="flex items-center justify-between rounded-md border border-border p-3">
                 <span className="text-sm">{item}</span>
                 <Badge variant="success">Ready</Badge>
@@ -320,6 +355,334 @@ function UsersPage() {
   )
 }
 
+type LightCard = {
+  no: number
+  stateLabel: string
+  tone: 'red' | 'yellow' | 'green' | 'off' | 'unknown' | 'no-data'
+  countLabel: string
+  updatedAtLabel: string
+}
+
+type SessionState = 'stopped' | 'connecting' | 'live' | 'reconnecting' | 'error'
+
+type SignalLightsQuery = {
+  gateway: GatewayOption
+  displayCount: DisplayCount
+  startNo: number
+}
+
+function SignalLightsPage() {
+  const [gatewayValue, setGatewayValue] = useState(gatewayOptions[0]?.value ?? '')
+  const [displayCount, setDisplayCount] = useState<DisplayCount>(1)
+  const [startNo, setStartNo] = useState(1)
+  const [enabled, setEnabled] = useState(false)
+  const [sessionState, setSessionState] = useState<SessionState>('stopped')
+  const [statusNote, setStatusNote] = useState<string>('已停止')
+  const [lastError, setLastError] = useState<string | null>(null)
+  const [displayCards, setDisplayCards] = useState<LightCard[]>(() => buildNoDataCards(1, 1))
+  const [sessionHasData, setSessionHasData] = useState(false)
+  const cacheRef = useRef<Record<string, DevicePayload>>({})
+  const socketRef = useRef<WebSocket | null>(null)
+  const reconnectTimerRef = useRef<number | null>(null)
+  const connectTimerRef = useRef<number | null>(null)
+  const manualCloseRef = useRef(false)
+  const sessionIdRef = useRef(0)
+  const activeQueryRef = useRef<SignalLightsQuery | null>(null)
+
+  const selectedGateway = gatewayOptions.find((option) => option.value === gatewayValue) ?? gatewayOptions[0]
+  const maxStartNo = getMaxStartNo(displayCount)
+  const currentQuery = useMemo<SignalLightsQuery>(
+    () => ({
+      gateway: selectedGateway,
+      displayCount,
+      startNo,
+    }),
+    [displayCount, selectedGateway, startNo],
+  )
+
+  const clearReconnectTimer = useEffectEvent(() => {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
+  })
+
+  const clearConnectTimer = useEffectEvent(() => {
+    if (connectTimerRef.current !== null) {
+      window.clearTimeout(connectTimerRef.current)
+      connectTimerRef.current = null
+    }
+  })
+
+  const closeSocket = useEffectEvent(() => {
+    clearConnectTimer()
+    clearReconnectTimer()
+    const socket = socketRef.current
+    if (socket) {
+      socketRef.current = null
+      socket.onopen = null
+      socket.onmessage = null
+      socket.onerror = null
+      socket.onclose = null
+      socket.close()
+    }
+  })
+
+  const updateViewFromCache = useEffectEvent((query: SignalLightsQuery) => {
+    const device = cacheRef.current[query.gateway.deviceAddr]
+    setDisplayCards(buildCards(device, query.startNo, query.displayCount))
+    setSessionHasData(true)
+  })
+
+  const stopSession = useEffectEvent((note = '已停止') => {
+    sessionIdRef.current += 1
+    activeQueryRef.current = null
+    manualCloseRef.current = true
+    closeSocket()
+    setEnabled(false)
+    setSessionState('stopped')
+    setStatusNote(note)
+    setLastError(null)
+    setSessionHasData(false)
+  })
+
+  const scheduleReconnect = useEffectEvent((sessionId: number) => {
+    clearReconnectTimer()
+    reconnectTimerRef.current = window.setTimeout(() => {
+      if (!manualCloseRef.current && activeQueryRef.current && sessionIdRef.current === sessionId) {
+        connect(activeQueryRef.current, sessionId, true)
+      }
+    }, 2000)
+  })
+
+  const connect = useEffectEvent((query: SignalLightsQuery, sessionId: number, isReconnect = false) => {
+    if (!lightsWsUrl) {
+      setSessionState('error')
+      setStatusNote('未配置 WebSocket 地址')
+      setLastError('请设置 VITE_LIGHTS_WS_URL')
+      setSessionHasData(false)
+      setEnabled(false)
+      return
+    }
+
+    const wsUrl = lightsWsUrl
+    activeQueryRef.current = query
+    clearConnectTimer()
+    clearReconnectTimer()
+    manualCloseRef.current = true
+    closeSocket()
+    manualCloseRef.current = false
+    setSessionState((state) => (state === 'reconnecting' ? 'reconnecting' : 'connecting'))
+    setStatusNote(isReconnect ? '重连中…' : '连接中…')
+    setLastError(null)
+
+    connectTimerRef.current = window.setTimeout(() => {
+      connectTimerRef.current = null
+
+      if (manualCloseRef.current || sessionIdRef.current !== sessionId) {
+        return
+      }
+
+      const socket = new WebSocket(wsUrl)
+      socketRef.current = socket
+
+      socket.onopen = () => {
+        if (socketRef.current !== socket || sessionIdRef.current !== sessionId) {
+          return
+        }
+
+        setSessionState('connecting')
+        setStatusNote('等待首帧快照…')
+      }
+
+      socket.onmessage = (event) => {
+        if (socketRef.current !== socket || sessionIdRef.current !== sessionId) {
+          return
+        }
+
+        try {
+          const message = JSON.parse(event.data) as SignalLightsMessage
+          if (message.type === 'snapshot') {
+            cacheRef.current = Object.fromEntries(message.devices.map((device) => [device.device_addr, device]))
+          } else if (message.type === 'update') {
+            cacheRef.current = {
+              ...cacheRef.current,
+              [message.device.device_addr]: message.device,
+            }
+          } else {
+            return
+          }
+
+          setSessionState('live')
+          setStatusNote('实时更新中')
+          setLastError(null)
+          updateViewFromCache(query)
+        } catch {
+          setLastError('收到无法解析的 WebSocket 消息')
+        }
+      }
+
+      socket.onerror = () => {
+        if (socketRef.current !== socket || sessionIdRef.current !== sessionId) {
+          return
+        }
+
+        setLastError('WebSocket 连接异常')
+      }
+
+      socket.onclose = () => {
+        if (socketRef.current === socket) {
+          socketRef.current = null
+        }
+
+        if (manualCloseRef.current || sessionIdRef.current !== sessionId) {
+          return
+        }
+
+        setSessionState('reconnecting')
+        setStatusNote('重连中…')
+        setLastError((value) => value ?? '连接已断开，正在重连')
+        scheduleReconnect(sessionId)
+      }
+    }, 0)
+  })
+
+  const startSession = useEffectEvent(() => {
+    const nextSessionId = sessionIdRef.current + 1
+    sessionIdRef.current = nextSessionId
+    setEnabled(true)
+    setSessionHasData(false)
+    connect(currentQuery, nextSessionId)
+  })
+
+  useEffect(() => {
+    return () => {
+      manualCloseRef.current = true
+      clearReconnectTimer()
+      closeSocket()
+    }
+  }, [])
+
+  const applyConfigChange = <T,>(nextValue: T, setter: (value: T) => void) => {
+    setter(nextValue)
+    if (enabled) {
+      stopSession('条件已变更，请重新开启')
+    }
+  }
+
+  const handleDisplayCountChange = (value: DisplayCount) => {
+    const nextMax = getMaxStartNo(value)
+    const nextStartNo = Math.min(startNo, nextMax)
+    setDisplayCount(value)
+    setStartNo(nextStartNo)
+    if (enabled) {
+      stopSession('条件已变更，请重新开启')
+    }
+  }
+
+  const statusText =
+    sessionState === 'live'
+      ? '实时更新中'
+      : sessionState === 'connecting'
+        ? '连接中…'
+        : sessionState === 'reconnecting'
+          ? '重连中…'
+          : sessionState === 'error'
+            ? '连接失败'
+            : statusNote
+
+  const visibleCards = sessionHasData ? displayCards : buildNoDataCards(startNo, displayCount)
+  const showLoading = enabled && !sessionHasData && (sessionState === 'connecting' || sessionState === 'reconnecting')
+
+  return (
+    <Page title="三色灯状态">
+      <div className="grid gap-4 xl:grid-cols-[340px_minmax(0,1fr)]">
+        <Card>
+          <CardHeader>
+            <CardTitle>查询条件</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <LabeledField label="LoRa 网关">
+              <select
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition focus-visible:ring-2 focus-visible:ring-ring"
+                value={gatewayValue}
+                onChange={(event) => applyConfigChange(event.target.value, setGatewayValue)}
+              >
+                {gatewayOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.value} - {option.label}
+                  </option>
+                ))}
+              </select>
+            </LabeledField>
+            <LabeledField label="展示数量">
+              <select
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition focus-visible:ring-2 focus-visible:ring-ring"
+                value={displayCount}
+                onChange={(event) => handleDisplayCountChange(Number(event.target.value) as DisplayCount)}
+              >
+                {displayCountOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </LabeledField>
+            <LabeledField label="起始编号">
+              <select
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition focus-visible:ring-2 focus-visible:ring-ring"
+                value={startNo}
+                onChange={(event) => applyConfigChange(Number(event.target.value), setStartNo)}
+              >
+                {Array.from({ length: maxStartNo }, (_, index) => index + 1).map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </LabeledField>
+            <div className="rounded-md border border-border bg-muted/50 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium">状态</p>
+                  <p className="mt-1 text-sm text-muted-foreground">{statusText}</p>
+                </div>
+                <Button onClick={() => (enabled ? stopSession() : startSession())}>{enabled ? '关闭' : '开启'}</Button>
+              </div>
+              {lastError && <p className="mt-3 text-sm text-amber-700 dark:text-amber-300">{lastError}</p>}
+              {!lightsWsUrl && <p className="mt-3 text-sm text-amber-700 dark:text-amber-300">缺少 `VITE_LIGHTS_WS_URL` 配置。</p>}
+            </div>
+          </CardContent>
+        </Card>
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-card px-4 py-3">
+            <div className="text-sm font-medium">
+              {currentQuery.gateway.label} · {startNo}-{startNo + displayCount - 1}
+            </div>
+            <Badge variant={sessionState === 'live' ? 'success' : 'secondary'}>{statusText}</Badge>
+          </div>
+          {showLoading ? (
+            <Card>
+              <CardContent className="py-12">
+                <div className="text-center">
+                  <div className="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                  <p className="text-sm font-medium">等待快照</p>
+                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            <div className="grid gap-4 xl:grid-cols-3">
+              {visibleCards.map((card) => (
+                <SignalLightCard key={card.no} card={card} />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </Page>
+  )
+}
+
 function SettingsPage() {
   return (
     <Page title="Settings" description="Application-level settings and Logto environment checks.">
@@ -330,9 +693,12 @@ function SettingsPage() {
             <CardDescription>Configure these values in `.env.local` before signing in.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
+            <SettingRow label="VITE_REQUIRE_AUTH" configured={authRequired} configuredLabel="Enabled" missingLabel="Disabled" />
             <SettingRow label="VITE_LOGTO_ENDPOINT" configured={Boolean(import.meta.env.VITE_LOGTO_ENDPOINT)} />
             <SettingRow label="VITE_LOGTO_APP_ID" configured={Boolean(import.meta.env.VITE_LOGTO_APP_ID)} />
             <SettingRow label="VITE_APP_URL" configured={Boolean(import.meta.env.VITE_APP_URL)} />
+            <SettingRow label="VITE_LIGHTS_WS_URL" configured={Boolean(lightsWsUrl)} />
+            <SettingRow label="Preview mode" configured={!authRequired} configuredLabel="Enabled" missingLabel="Off" />
           </CardContent>
         </Card>
         <Card>
@@ -341,9 +707,16 @@ function SettingsPage() {
             <CardDescription>First-version boundaries are intentionally narrow.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 text-sm text-muted-foreground">
-            <p>Authentication uses the Logto React SDK redirect flow.</p>
+            <p>Authentication can be toggled at build time with `VITE_REQUIRE_AUTH`.</p>
             <p>User data is mock data and does not mutate Logto resources.</p>
-            <p>Protected pages require a real Logto session; fake login is not available.</p>
+            <p>Signal light status is streamed from the backend over WebSocket.</p>
+            <p>
+              {authEnabled
+                ? 'Protected pages require a real Logto session.'
+                : authRequired
+                  ? 'Authentication is required, but Logto is not configured yet.'
+                  : 'The app is running in public preview mode with no login requirement.'}
+            </p>
           </CardContent>
         </Card>
       </div>
@@ -351,41 +724,67 @@ function SettingsPage() {
   )
 }
 
-function SettingRow({ label, configured }: { label: string; configured: boolean }) {
+function SettingRow({
+  label,
+  configured,
+  configuredLabel = 'Configured',
+  missingLabel = 'Missing',
+}: {
+  label: string
+  configured: boolean
+  configuredLabel?: string
+  missingLabel?: string
+}) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-md border border-border p-3">
       <code className="text-xs sm:text-sm">{label}</code>
-      <Badge variant={configured ? 'success' : 'secondary'}>{configured ? 'Configured' : 'Missing'}</Badge>
+      <Badge variant={configured ? 'success' : 'secondary'}>{configured ? configuredLabel : missingLabel}</Badge>
     </div>
   )
 }
 
-function SignInPage() {
+function EntryPage() {
   const { isAuthenticated, signIn } = useLogto()
   const location = useLocation()
+  const navigate = useNavigate()
   const from = (location.state as { from?: string } | null)?.from || '/dashboard'
-
-  if (isAuthenticated) {
-    return <Navigate to={from} replace />
-  }
 
   return (
     <div className="grid min-h-screen place-items-center bg-background px-4 text-foreground">
       <Card className="w-full max-w-md">
         <CardHeader>
-          <CardTitle>Sign in to My Admin</CardTitle>
-          <CardDescription>Use Logto to start a protected admin session.</CardDescription>
+          <CardTitle>My Admin</CardTitle>
+          <CardDescription>
+            {authEnabled
+              ? 'Use Logto to start a protected admin session.'
+              : authRequired
+                ? 'Authentication is required before the admin console can be opened.'
+                : 'Open the public preview of the admin console.'}
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {!isLogtoConfigured && (
+          {authMisconfigured && (
             <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-              Missing Logto configuration. Create `.env.local` from `.env.example` before signing in.
+              `VITE_REQUIRE_AUTH=true` is enabled, but Logto is not fully configured yet. Set `VITE_LOGTO_ENDPOINT` and
+              `VITE_LOGTO_APP_ID` before turning on login.
             </div>
           )}
-          <Button className="w-full" disabled={!isLogtoConfigured} onClick={() => signIn(callbackUrl)}>
-            <LogIn className="h-4 w-4" />
-            Continue with Logto
-          </Button>
+          {authEnabled ? (
+            isAuthenticated ? (
+              <Button className="w-full" onClick={() => navigate(from)}>
+                Open admin console
+              </Button>
+            ) : (
+              <Button className="w-full" onClick={() => signIn(callbackUrl)}>
+                <LogIn className="h-4 w-4" />
+                Continue with Logto
+              </Button>
+            )
+          ) : (
+            <Button className="w-full" disabled={authRequired} onClick={() => navigate('/dashboard')}>
+              {authRequired ? 'Waiting for Logto configuration' : 'Open preview'}
+            </Button>
+          )}
         </CardContent>
       </Card>
     </div>
@@ -393,6 +792,14 @@ function SignInPage() {
 }
 
 function CallbackPage() {
+  if (!authEnabled) {
+    return <Navigate to="/" replace />
+  }
+
+  return <CallbackHandler />
+}
+
+function CallbackHandler() {
   const navigate = useNavigate()
   const { isLoading } = useHandleSignInCallback(() => {
     navigate('/dashboard', { replace: true })
@@ -417,15 +824,45 @@ function FullScreenState({ title, description }: { title: string; description: s
   )
 }
 
-function Page({ title, description, children }: { title: string; description: string; children: ReactNode }) {
+function Page({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
     <div className="space-y-5">
       <div>
         <h1 className="text-2xl font-semibold tracking-normal">{title}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+        {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
       </div>
       {children}
     </div>
+  )
+}
+
+function LabeledField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="space-y-2">
+      <span className="text-sm font-medium">{label}</span>
+      {children}
+    </label>
+  )
+}
+
+function SignalLightCard({ card }: { card: LightCard }) {
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-xl">灯号 {card.no}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="flex items-center gap-3">
+          <span className={cn('h-4 w-4 rounded-full border', lightToneClasses[card.tone])} />
+          <span className="text-sm font-medium">{card.stateLabel}</span>
+        </div>
+        <div className="rounded-md border border-border p-3">
+          <p className="text-xs uppercase tracking-wide text-muted-foreground">计件数</p>
+          <p className="mt-1 text-2xl font-semibold">{card.countLabel}</p>
+        </div>
+        <div className="text-sm text-muted-foreground">更新时间：{card.updatedAtLabel}</div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -446,3 +883,49 @@ function useTheme() {
 }
 
 export default App
+
+const lightToneClasses: Record<LightCard['tone'], string> = {
+  red: 'border-red-200 bg-red-500',
+  yellow: 'border-amber-200 bg-amber-400',
+  green: 'border-emerald-200 bg-emerald-500',
+  off: 'border-slate-200 bg-slate-400',
+  unknown: 'border-violet-200 bg-violet-400',
+  'no-data': 'border-slate-300 bg-transparent',
+}
+
+function buildCards(device: DevicePayload | undefined, startNo: number, displayCount: DisplayCount) {
+  return Array.from({ length: displayCount }, (_, index) => {
+    const no = startNo + index
+    const light = device?.lights.find((item) => item.no === no)
+
+    if (!device || !light) {
+      return {
+        no,
+        stateLabel: '无数据',
+        tone: 'no-data' as const,
+        countLabel: '--',
+        updatedAtLabel: '--',
+      }
+    }
+
+    const normalized = normalizeLightStatus(light.status_name)
+
+    return {
+      no,
+      stateLabel: normalized.label,
+      tone: normalized.tone,
+      countLabel: String(light.green_count),
+      updatedAtLabel: formatCollectedAt(device.collected_at),
+    }
+  })
+}
+
+function buildNoDataCards(startNo: number, displayCount: DisplayCount) {
+  return Array.from({ length: displayCount }, (_, index) => ({
+    no: startNo + index,
+    stateLabel: '无数据',
+    tone: 'no-data' as const,
+    countLabel: '--',
+    updatedAtLabel: '--',
+  }))
+}

@@ -1,3 +1,10 @@
+{$APP_DOMAIN} {
+  root * /srv/my-admin/dist
+  encode gzip zstd
+  try_files {path} /index.html
+  file_server
+}
+
 {$AUTH_DOMAIN} {
   reverse_proxy logto:3001
 }
