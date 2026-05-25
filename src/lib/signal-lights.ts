@@ -1,11 +1,3 @@
-export type GatewayOption = {
-  value: string
-  label: string
-  deviceAddr: string
-}
-
-export type DisplayCount = 1 | 2 | 3
-
 export type LightPayload = {
   no: number
   status_code: string
@@ -33,15 +25,7 @@ export type UpdateMessage = {
 
 export type SignalLightsMessage = SnapshotMessage | UpdateMessage
 
-export const gatewayOptions: GatewayOption[] = [{ value: '01', label: '一车间lora1', deviceAddr: '01' }]
-
-export const displayCountOptions: DisplayCount[] = [1, 2, 3]
-
 export const lightsWsUrl = import.meta.env.VITE_LIGHTS_WS_URL as string | undefined
-
-export function getMaxStartNo(displayCount: DisplayCount) {
-  return 51 - displayCount
-}
 
 export function normalizeLightStatus(statusName: string | undefined) {
   switch (statusName?.toLowerCase()) {

@@ -13,6 +13,7 @@ import {
   PanelLeftClose,
   Search,
   Settings,
+  RefreshCw,
   Sun,
   Users,
   X,
@@ -23,17 +24,13 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './com
 import { Input } from './components/ui/input'
 import { appUrl, authEnabled, authMisconfigured, authRequired, callbackUrl } from './lib/logto'
 import {
-  displayCountOptions,
   formatCollectedAt,
-  gatewayOptions,
-  getMaxStartNo,
   lightsWsUrl,
   normalizeLightStatus,
   type DevicePayload,
-  type DisplayCount,
-  type GatewayOption,
   type SignalLightsMessage,
 } from './lib/signal-lights'
+import { fetchMachines, type MachineRecord } from './lib/machines'
 import { cn } from './lib/utils'
 import { auditEvents, mockUsers, systemMetrics } from './lib/mock-data'
 
@@ -122,7 +119,7 @@ function Shell() {
 function Sidebar({ collapsed, closeMobile }: { collapsed: boolean; closeMobile: () => void }) {
   const links = [
     { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { to: '/signal-lights', label: '三色灯状态', icon: Activity },
+    { to: '/signal-lights', label: '机器状态', icon: Activity },
     { to: '/users', label: 'Users', icon: Users },
     { to: '/settings', label: 'Settings', icon: Settings },
   ]
@@ -365,21 +362,24 @@ type LightCard = {
 
 type SessionState = 'stopped' | 'connecting' | 'live' | 'reconnecting' | 'error'
 
-type SignalLightsQuery = {
-  gateway: GatewayOption
-  displayCount: DisplayCount
-  startNo: number
+type MachineSessionQuery = {
+  workshop: string
+  machineCode: string
+  deviceKey: string
 }
 
 function SignalLightsPage() {
-  const [gatewayValue, setGatewayValue] = useState(gatewayOptions[0]?.value ?? '')
-  const [displayCount, setDisplayCount] = useState<DisplayCount>(1)
-  const [startNo, setStartNo] = useState(1)
+  const [machines, setMachines] = useState<MachineRecord[]>([])
+  const [workshop, setWorkshop] = useState('')
+  const [machineSearch, setMachineSearch] = useState('')
+  const [machineCode, setMachineCode] = useState('')
+  const [machineLoading, setMachineLoading] = useState(false)
+  const [machineError, setMachineError] = useState<string | null>(null)
   const [enabled, setEnabled] = useState(false)
   const [sessionState, setSessionState] = useState<SessionState>('stopped')
   const [statusNote, setStatusNote] = useState<string>('已停止')
   const [lastError, setLastError] = useState<string | null>(null)
-  const [displayCards, setDisplayCards] = useState<LightCard[]>(() => buildNoDataCards(1, 1))
+  const [displayCards, setDisplayCards] = useState<LightCard[]>([])
   const [sessionHasData, setSessionHasData] = useState(false)
   const cacheRef = useRef<Record<string, DevicePayload>>({})
   const socketRef = useRef<WebSocket | null>(null)
@@ -387,18 +387,38 @@ function SignalLightsPage() {
   const connectTimerRef = useRef<number | null>(null)
   const manualCloseRef = useRef(false)
   const sessionIdRef = useRef(0)
-  const activeQueryRef = useRef<SignalLightsQuery | null>(null)
+  const activeQueryRef = useRef<MachineSessionQuery | null>(null)
+  const initialMachineLoadRef = useRef(false)
 
-  const selectedGateway = gatewayOptions.find((option) => option.value === gatewayValue) ?? gatewayOptions[0]
-  const maxStartNo = getMaxStartNo(displayCount)
-  const currentQuery = useMemo<SignalLightsQuery>(
-    () => ({
-      gateway: selectedGateway,
-      displayCount,
-      startNo,
-    }),
-    [displayCount, selectedGateway, startNo],
+  const workshopOptions = useMemo(
+    () => Array.from(new Set(machines.map((machine) => machine.workshop))),
+    [machines],
   )
+
+  const filteredMachines = useMemo(() => {
+    if (!workshop) {
+      return machines
+    }
+
+    return machines.filter((machine) => machine.workshop === workshop)
+  }, [machines, workshop])
+
+  const selectedMachine = useMemo(
+    () => filteredMachines.find((machine) => machine.code === machineCode.trim()),
+    [filteredMachines, machineCode],
+  )
+
+  const currentQuery = useMemo<MachineSessionQuery | null>(() => {
+    if (!selectedMachine) {
+      return null
+    }
+
+    return {
+      workshop: selectedMachine.workshop,
+      machineCode: selectedMachine.code,
+      deviceKey: selectedMachine.deviceAddr ?? selectedMachine.code,
+    }
+  }, [selectedMachine])
 
   const clearReconnectTimer = useEffectEvent(() => {
     if (reconnectTimerRef.current !== null) {
@@ -428,12 +448,6 @@ function SignalLightsPage() {
     }
   })
 
-  const updateViewFromCache = useEffectEvent((query: SignalLightsQuery) => {
-    const device = cacheRef.current[query.gateway.deviceAddr]
-    setDisplayCards(buildCards(device, query.startNo, query.displayCount))
-    setSessionHasData(true)
-  })
-
   const stopSession = useEffectEvent((note = '已停止') => {
     sessionIdRef.current += 1
     activeQueryRef.current = null
@@ -455,7 +469,13 @@ function SignalLightsPage() {
     }, 2000)
   })
 
-  const connect = useEffectEvent((query: SignalLightsQuery, sessionId: number, isReconnect = false) => {
+  const updateViewFromCache = useEffectEvent((query: MachineSessionQuery) => {
+    const device = cacheRef.current[query.deviceKey]
+    setDisplayCards(buildCards(device))
+    setSessionHasData(Boolean(device))
+  })
+
+  const connect = useEffectEvent((query: MachineSessionQuery, sessionId: number, isReconnect = false) => {
     if (!lightsWsUrl) {
       setSessionState('error')
       setStatusNote('未配置 WebSocket 地址')
@@ -547,38 +567,101 @@ function SignalLightsPage() {
     }, 0)
   })
 
-  const startSession = useEffectEvent(() => {
-    const nextSessionId = sessionIdRef.current + 1
-    sessionIdRef.current = nextSessionId
-    setEnabled(true)
-    setSessionHasData(false)
-    connect(currentQuery, nextSessionId)
+  const refreshMachines = useEffectEvent(async (signal?: AbortSignal) => {
+    setMachineLoading(true)
+
+    try {
+      const nextMachines = await fetchMachines(signal)
+      if (signal?.aborted) {
+        return
+      }
+
+      setMachines(nextMachines)
+      setMachineError(nextMachines.length === 0 ? '未获取到机器列表' : null)
+
+      const nextSelection = resolveMachineSelection(nextMachines, workshop, machineCode)
+      const selectionChanged = nextSelection.workshop !== workshop || nextSelection.machineCode !== machineCode
+
+      if (selectionChanged) {
+        setWorkshop(nextSelection.workshop)
+        setMachineCode(nextSelection.machineCode)
+        setMachineSearch(nextSelection.machineCode)
+
+        if (enabled) {
+          stopSession('机器列表已更新，请重新开启')
+        }
+      } else if (!machineSearch) {
+        setMachineSearch(nextSelection.machineCode)
+      }
+    } catch (error) {
+      if (signal?.aborted) {
+        return
+      }
+
+      setMachineError(error instanceof Error ? error.message : '获取机器列表失败')
+    } finally {
+      if (!signal?.aborted) {
+        setMachineLoading(false)
+      }
+    }
   })
 
   useEffect(() => {
+    if (initialMachineLoadRef.current) {
+      return
+    }
+
+    initialMachineLoadRef.current = true
+    const controller = new AbortController()
+    void refreshMachines(controller.signal)
+
     return () => {
+      controller.abort()
       manualCloseRef.current = true
       clearReconnectTimer()
       closeSocket()
     }
   }, [])
 
-  const applyConfigChange = <T,>(nextValue: T, setter: (value: T) => void) => {
-    setter(nextValue)
-    if (enabled) {
+  useEffect(() => {
+    if (!enabled || !currentQuery || !activeQueryRef.current) {
+      return
+    }
+
+    if (activeQueryRef.current.deviceKey !== currentQuery.deviceKey) {
       stopSession('条件已变更，请重新开启')
     }
+  }, [currentQuery, enabled, stopSession])
+
+  const applyMachineSelection = () => {
+    const nextMachine = filteredMachines.find((machine) => machine.code === machineSearch.trim())
+    if (!nextMachine) {
+      setMachineError('未找到对应的 machine code')
+      return
+    }
+
+    setMachineError(null)
+    if (enabled && activeQueryRef.current?.deviceKey !== (nextMachine.deviceAddr ?? nextMachine.code)) {
+      stopSession('条件已变更，请重新开启')
+    }
+
+    setWorkshop(nextMachine.workshop)
+    setMachineCode(nextMachine.code)
+    setMachineSearch(nextMachine.code)
   }
 
-  const handleDisplayCountChange = (value: DisplayCount) => {
-    const nextMax = getMaxStartNo(value)
-    const nextStartNo = Math.min(startNo, nextMax)
-    setDisplayCount(value)
-    setStartNo(nextStartNo)
-    if (enabled) {
-      stopSession('条件已变更，请重新开启')
+  const startSession = useEffectEvent(() => {
+    if (!currentQuery) {
+      setMachineError('请选择可用的 machine code')
+      return
     }
-  }
+
+    const nextSessionId = sessionIdRef.current + 1
+    sessionIdRef.current = nextSessionId
+    setEnabled(true)
+    setSessionHasData(false)
+    connect(currentQuery, nextSessionId)
+  })
 
   const statusText =
     sessionState === 'live'
@@ -591,73 +674,121 @@ function SignalLightsPage() {
             ? '连接失败'
             : statusNote
 
-  const visibleCards = sessionHasData ? displayCards : buildNoDataCards(startNo, displayCount)
   const showLoading = enabled && !sessionHasData && (sessionState === 'connecting' || sessionState === 'reconnecting')
+  const currentMachineSummary = currentQuery
+    ? `${currentQuery.workshop} · ${currentQuery.machineCode}`
+    : machineSearch
+      ? `未匹配 machine code：${machineSearch}`
+      : '未选择 machine code'
 
   return (
-    <Page title="三色灯状态">
-      <div className="grid gap-4 xl:grid-cols-[340px_minmax(0,1fr)]">
+    <Page title="机器状态" description="按车间和 machine code 查询状态推送。">
+      <div className="grid gap-4 xl:grid-cols-[380px_minmax(0,1fr)]">
         <Card>
           <CardHeader>
             <CardTitle>查询条件</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
-            <LabeledField label="LoRa 网关">
+            <LabeledField label="车间">
               <select
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition focus-visible:ring-2 focus-visible:ring-ring"
-                value={gatewayValue}
-                onChange={(event) => applyConfigChange(event.target.value, setGatewayValue)}
+                value={workshop}
+                onChange={(event) => {
+                  const nextWorkshop = event.target.value
+                  const nextWorkshopMachines = machines.filter((machine) => machine.workshop === nextWorkshop)
+                  const nextMachine = nextWorkshopMachines[0]
+
+                  setWorkshop(nextWorkshop)
+                  setMachineCode(nextMachine?.code ?? '')
+                  setMachineSearch(nextMachine?.code ?? '')
+                }}
+                disabled={machineLoading || workshopOptions.length === 0}
               >
-                {gatewayOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.value} - {option.label}
-                  </option>
-                ))}
+                {workshopOptions.length === 0 ? (
+                  <option value="">暂无车间</option>
+                ) : (
+                  workshopOptions.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))
+                )}
               </select>
             </LabeledField>
-            <LabeledField label="展示数量">
-              <select
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition focus-visible:ring-2 focus-visible:ring-ring"
-                value={displayCount}
-                onChange={(event) => handleDisplayCountChange(Number(event.target.value) as DisplayCount)}
-              >
-                {displayCountOptions.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
+            <LabeledField label="machine code">
+              <div className="space-y-2">
+                <Input
+                  list="machine-code-options"
+                  value={machineSearch}
+                  onChange={(event) => setMachineSearch(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      applyMachineSelection()
+                    }
+                  }}
+                  placeholder="输入 machine code"
+                  disabled={machineLoading || workshopOptions.length === 0}
+                />
+                <datalist id="machine-code-options">
+                  {filteredMachines.map((machine) => (
+                    <option key={`${machine.workshop}-${machine.code}`} value={machine.code}>
+                      {machine.name ? `${machine.code} · ${machine.name}` : machine.code}
+                    </option>
+                  ))}
+                </datalist>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={applyMachineSelection}
+                    disabled={!machineSearch.trim() || !filteredMachines.some((machine) => machine.code === machineSearch.trim())}
+                  >
+                    <Search className="h-4 w-4" />
+                    应用 machine code
+                  </Button>
+                  <span className="text-xs text-muted-foreground">候选 {filteredMachines.length} 台</span>
+                </div>
+              </div>
             </LabeledField>
-            <LabeledField label="起始编号">
-              <select
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition focus-visible:ring-2 focus-visible:ring-ring"
-                value={startNo}
-                onChange={(event) => applyConfigChange(Number(event.target.value), setStartNo)}
-              >
-                {Array.from({ length: maxStartNo }, (_, index) => index + 1).map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </LabeledField>
+            <div className="rounded-md border border-border bg-muted/50 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium">机器列表</p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {machineLoading ? '正在加载…' : machineError ? machineError : `已加载 ${machines.length} 台机器`}
+                  </p>
+                </div>
+                <Button variant="outline" size="sm" onClick={() => void refreshMachines()}>
+                  <RefreshCw className={cn('h-4 w-4', machineLoading && 'animate-spin')} />
+                  获取机器
+                </Button>
+              </div>
+              {machineError && <p className="mt-3 text-sm text-amber-700 dark:text-amber-300">{machineError}</p>}
+            </div>
             <div className="rounded-md border border-border bg-muted/50 p-3">
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm font-medium">状态</p>
                   <p className="mt-1 text-sm text-muted-foreground">{statusText}</p>
                 </div>
-                <Button onClick={() => (enabled ? stopSession() : startSession())}>{enabled ? '关闭' : '开启'}</Button>
+                <Button onClick={() => (enabled ? stopSession() : startSession())} disabled={!currentQuery || machineLoading || workshopOptions.length === 0}>
+                  {enabled ? '关闭' : '开启'}
+                </Button>
               </div>
-              {lastError && <p className="mt-3 text-sm text-amber-700 dark:text-amber-300">{lastError}</p>}
+              <p className="mt-3 text-sm text-muted-foreground">当前选择：{currentMachineSummary}</p>
+              {lastError && <p className="mt-2 text-sm text-amber-700 dark:text-amber-300">{lastError}</p>}
               {!lightsWsUrl && <p className="mt-3 text-sm text-amber-700 dark:text-amber-300">缺少 `VITE_LIGHTS_WS_URL` 配置。</p>}
             </div>
           </CardContent>
         </Card>
         <div className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-card px-4 py-3">
-            <div className="text-sm font-medium">
-              {currentQuery.gateway.label} · {startNo}-{startNo + displayCount - 1}
+            <div className="min-w-0 text-sm font-medium">
+              <div className="truncate">{currentMachineSummary}</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {selectedMachine?.name || selectedMachine?.deviceName || '机器状态推送'}
+              </div>
             </div>
             <Badge variant={sessionState === 'live' ? 'success' : 'secondary'}>{statusText}</Badge>
           </div>
@@ -670,17 +801,69 @@ function SignalLightsPage() {
                 </div>
               </CardContent>
             </Card>
-          ) : (
+          ) : sessionHasData ? (
             <div className="grid gap-4 xl:grid-cols-3">
-              {visibleCards.map((card) => (
+              {displayCards.map((card) => (
                 <SignalLightCard key={card.no} card={card} />
               ))}
             </div>
+          ) : (
+            <Card>
+              <CardContent className="py-12">
+                <div className="text-center text-sm text-muted-foreground">
+                  <p className="font-medium text-foreground">暂无机器状态</p>
+                  <p className="mt-1">选择车间和 machine code 后点击“开启”接收后端推送。</p>
+                </div>
+              </CardContent>
+            </Card>
           )}
         </div>
       </div>
     </Page>
   )
+}
+
+function resolveMachineSelection(machines: MachineRecord[], currentWorkshop: string, currentMachineCode: string) {
+  const exactWorkshopMachine = machines.find(
+    (machine) => machine.workshop === currentWorkshop && machine.code === currentMachineCode,
+  )
+  if (exactWorkshopMachine) {
+    return {
+      workshop: exactWorkshopMachine.workshop,
+      machineCode: exactWorkshopMachine.code,
+    }
+  }
+
+  if (!currentWorkshop) {
+    const globalMatch = machines.find((machine) => machine.code === currentMachineCode)
+    if (globalMatch) {
+      return {
+        workshop: globalMatch.workshop,
+        machineCode: globalMatch.code,
+      }
+    }
+  }
+
+  const workshopMachines = currentWorkshop ? machines.filter((machine) => machine.workshop === currentWorkshop) : []
+  if (workshopMachines.length > 0) {
+    return {
+      workshop: currentWorkshop,
+      machineCode: workshopMachines[0].code,
+    }
+  }
+
+  const firstMachine = machines[0]
+  if (firstMachine) {
+    return {
+      workshop: firstMachine.workshop,
+      machineCode: firstMachine.code,
+    }
+  }
+
+  return {
+    workshop: '',
+    machineCode: '',
+  }
 }
 
 function SettingsPage() {
@@ -698,6 +881,7 @@ function SettingsPage() {
             <SettingRow label="VITE_LOGTO_APP_ID" configured={Boolean(import.meta.env.VITE_LOGTO_APP_ID)} />
             <SettingRow label="VITE_APP_URL" configured={Boolean(import.meta.env.VITE_APP_URL)} />
             <SettingRow label="VITE_LIGHTS_WS_URL" configured={Boolean(lightsWsUrl)} />
+            <SettingRow label="VITE_MACHINES_API_URL" configured={Boolean(import.meta.env.VITE_MACHINES_API_URL)} configuredLabel="Override" missingLabel="Proxy /api/machines" />
             <SettingRow label="Preview mode" configured={!authRequired} configuredLabel="Enabled" missingLabel="Off" />
           </CardContent>
         </Card>
@@ -893,39 +1077,22 @@ const lightToneClasses: Record<LightCard['tone'], string> = {
   'no-data': 'border-slate-300 bg-transparent',
 }
 
-function buildCards(device: DevicePayload | undefined, startNo: number, displayCount: DisplayCount) {
-  return Array.from({ length: displayCount }, (_, index) => {
-    const no = startNo + index
-    const light = device?.lights.find((item) => item.no === no)
+function buildCards(device: DevicePayload | undefined) {
+  if (!device) {
+    return []
+  }
 
-    if (!device || !light) {
+  return [...device.lights]
+    .sort((left, right) => left.no - right.no)
+    .map((light) => {
+      const normalized = normalizeLightStatus(light.status_name)
+
       return {
-        no,
-        stateLabel: '无数据',
-        tone: 'no-data' as const,
-        countLabel: '--',
-        updatedAtLabel: '--',
+        no: light.no,
+        stateLabel: normalized.label,
+        tone: normalized.tone,
+        countLabel: String(light.green_count),
+        updatedAtLabel: formatCollectedAt(device.collected_at),
       }
-    }
-
-    const normalized = normalizeLightStatus(light.status_name)
-
-    return {
-      no,
-      stateLabel: normalized.label,
-      tone: normalized.tone,
-      countLabel: String(light.green_count),
-      updatedAtLabel: formatCollectedAt(device.collected_at),
-    }
-  })
-}
-
-function buildNoDataCards(startNo: number, displayCount: DisplayCount) {
-  return Array.from({ length: displayCount }, (_, index) => ({
-    no: startNo + index,
-    stateLabel: '无数据',
-    tone: 'no-data' as const,
-    countLabel: '--',
-    updatedAtLabel: '--',
-  }))
+    })
 }
